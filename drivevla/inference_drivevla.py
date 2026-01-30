@@ -5,9 +5,11 @@ from llava.utils import disable_torch_init
 import time
 import json
 import os
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 import deepspeed
+import cv2
+import numpy as np
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -37,6 +39,65 @@ def read_processed_ids(output_file):
 
 def load_image(cam_path):
     return Image.open(cam_path).convert('RGB')
+
+def visualize_prediction(data, result, output_dir, vis_enabled=True):
+    """
+    Visualize camera image with predicted trajectory
+    Args:
+        data: Input data dict containing images
+        result: Prediction result containing trajectory
+        output_dir: Directory to save visualization
+        vis_enabled: Whether to save visualization
+    """
+    if not vis_enabled:
+        return
+
+    try:
+        # Create visualization directory
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Extract trajectory from answer if available
+        answer_text = result['answer'][0] if isinstance(result['answer'], list) else result['answer']
+
+        # Try to find camera image from data
+        # The image tensor is in data, shape: [B, T, C, H, W] or similar
+        if 'img' in data and data['img'] is not None:
+            img_tensor = data['img'][0]  # Get first batch
+
+            # Convert tensor to numpy image
+            if len(img_tensor.shape) == 4:  # [T, C, H, W]
+                img_tensor = img_tensor[0]  # Get first timestep
+
+            # Denormalize and convert to uint8
+            img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
+            img_np = ((img_np - img_np.min()) / (img_np.max() - img_np.min()) * 255).astype(np.uint8)
+
+            # Convert to PIL for drawing
+            img_pil = Image.fromarray(img_np)
+            draw = ImageDraw.Draw(img_pil)
+
+            # Draw answer text on image
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+            except:
+                font = ImageFont.load_default()
+
+            # Add text with background
+            text_lines = answer_text[:200].split('\n')[:5]  # First 200 chars, max 5 lines
+            y_text = 10
+            for line in text_lines:
+                bbox = draw.textbbox((10, y_text), line, font=font)
+                draw.rectangle(bbox, fill=(0, 0, 0, 128))
+                draw.text((10, y_text), line, fill=(0, 255, 0), font=font)
+                y_text += 25
+
+            # Save visualization
+            sample_id = result.get('id', 'unknown')
+            output_path = os.path.join(output_dir, f"vis_{sample_id}.jpg")
+            img_pil.save(output_path, quality=95)
+
+    except Exception as e:
+        print(f"Visualization error: {e}")
 
 def load_model_with_deepspeed(args, device):
     """
@@ -247,14 +308,19 @@ def inference_planning_oriented_vlm(args):
     
     for data in tqdm_bar:
         data = move_data_to_device(data, device)
-        
+
         start_time = time.time()
         result = inference_data(data, model_engine, tokenizer, args)
         inference_time = time.time() - start_time
-        
+
         if rank == 0:
             tqdm_bar.set_postfix_str(f'Inference: {inference_time:.2f}s')
-        
+
+            # Visualize predictions (only on rank 0)
+            if args.visualize:
+                vis_dir = os.path.join(os.path.dirname(args.output), 'visualizations')
+                visualize_prediction(data, result, vis_dir, vis_enabled=True)
+
         # Each GPU writes to its own file
         with open(rank_output, 'a', encoding='utf-8') as f:
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
@@ -317,6 +383,7 @@ def main():
     parser.add_argument("--bf16", action="store_true", help="Use BF16 precision")
     parser.add_argument("--zero-stage", type=int, default=2, choices=[0, 1, 2, 3],
                         help="ZeRO optimization stage")
+    parser.add_argument("--visualize", action="store_true", help="Save visualizations of predictions")
     
     # DDP related arguments
     parser.add_argument("--local_rank", type=int, default=int(os.getenv('LOCAL_RANK', -1)),
